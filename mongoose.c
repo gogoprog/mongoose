@@ -100,9 +100,9 @@ typedef SOCKET sock_t;
 #include <fcntl.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <unistd.h>
-#include <signal.h>
 #include <arpa/inet.h>  // For inet_pton() when NS_ENABLE_IPV6 is defined
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -648,6 +648,7 @@ static void read_from_socket(struct ns_connection *conn) {
 
     conn->flags &= ~NSF_CONNECTING;
     ret = getsockopt(conn->sock, SOL_SOCKET, SO_ERROR, (char *) &ok, &len);
+    (void) ret;
 #ifdef NS_ENABLE_SSL
     if (ret == 0 && ok == 0 && conn->ssl != NULL) {
       int res = SSL_connect(conn->ssl);
@@ -742,9 +743,11 @@ int ns_send(struct ns_connection *conn, const void *buf, int len) {
 }
 
 static void add_to_set(sock_t sock, fd_set *set, sock_t *max_fd) {
-  if (sock >= 0) FD_SET(sock, set);
-  if (sock > *max_fd) {
-    *max_fd = sock;
+  if (sock != INVALID_SOCKET) {
+    FD_SET(sock, set);
+    if (*max_fd == INVALID_SOCKET || sock > *max_fd) {
+      *max_fd = sock;
+    }
   }
 }
 
@@ -858,6 +861,7 @@ struct ns_connection *ns_connect(struct ns_server *server, const char *host,
   conn->sock = sock;
   conn->connection_data = param;
   conn->flags = NSF_CONNECTING;
+  conn->last_io_time = time(NULL);
 
 #ifdef NS_ENABLE_SSL
   if (use_ssl &&
@@ -948,7 +952,9 @@ void ns_server_free(struct ns_server *s) {
 
 #include <ctype.h>
 
-#ifdef _WIN32
+#ifdef _WIN32         //////////////// Windows specific defines and includes
+#include <io.h>       // For _lseeki64
+#include <direct.h>   // For _mkdir
 #ifndef S_ISDIR
 #define S_ISDIR(x) ((x) & _S_IFDIR)
 #endif
@@ -964,15 +970,22 @@ void ns_server_free(struct ns_server *s) {
 #define STR(x) STRX(x)
 #define __func__ __FILE__ ":" STR(__LINE__)
 #endif
+#define INT64_FMT  "I64d"
+#define stat(x, y) mg_stat((x), (y))
+#define fopen(x, y) mg_fopen((x), (y))
+#define open(x, y) mg_open((x), (y))
+#define flockfile(x)      ((void) (x))
+#define funlockfile(x)    ((void) (x))
 typedef struct _stati64 file_stat_t;
-#else
+typedef HANDLE pid_t;
+#else                    ////////////// UNIX specific defines and includes
 #include <dirent.h>
 #include <inttypes.h>
 #include <pwd.h>
 #define O_BINARY 0
 #define INT64_FMT PRId64
 typedef struct stat file_stat_t;
-#endif
+#endif                  //////// End of platform-specific defines and includes
 
 #include "mongoose.h"
 
@@ -1622,7 +1635,7 @@ static pid_t start_process(char *interp, const char *cmd, const char *env,
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
 
-  return pi.hProcess;
+  return (pid_t) pi.hProcess;
 }
 #else
 static pid_t start_process(const char *interp, const char *cmd, const char *env,
@@ -2247,19 +2260,26 @@ void mg_printf_data(struct mg_connection *c, const char *fmt, ...) {
   struct connection *conn = MG_CONN_2_CONN(c);
   struct iobuf *io = &conn->ns_conn->send_iobuf;
   va_list ap;
-  static const char chunk_len[] = "        \r\n";
-  int len, n, cl = sizeof(chunk_len) - 1;
-  char *p, buf[9];
+  int len, n;
+  char *p;
 
   terminate_headers(c);
 
+  // Write the placeholder for the chunk size
+  p = io->buf + io->len;
+  iobuf_append(io, "        \r\n", 10);
+
+  // Write chunk itself
   va_start(ap, fmt);
-  ns_send(conn->ns_conn, chunk_len, cl);
-  p = io->buf + io->len - cl;
   len = ns_vprintf(conn->ns_conn, fmt, ap);
-  n = mg_snprintf(buf, sizeof(buf), "%X", len);
-  memcpy(p, buf, n < 9 ? n : 8);
   va_end(ap);
+
+  // Record size
+  n = mg_snprintf(p, 7, "%X", len);
+  p[n] = ' ';
+
+  // Write terminating new line
+  mg_write(c, "\r\n", 2);
 }
 
 #if !defined(MONGOOSE_NO_WEBSOCKET) || !defined(MONGOOSE_NO_AUTH)
@@ -4235,7 +4255,9 @@ static void close_local_endpoint(struct connection *conn) {
   iobuf_remove(&conn->ns_conn->recv_iobuf, conn->mg_conn.content_len);
   conn->endpoint_type = EP_NONE;
   conn->cl = conn->num_bytes_sent = conn->request_len = 0;
-  conn->ns_conn->flags = conn->ns_conn->flags & NSF_ACCEPTED ? NSF_ACCEPTED : 0;
+  conn->ns_conn->flags &= ~(NSF_FINISHED_SENDING_DATA |
+                            NSF_BUFFER_BUT_DONT_SEND | NSF_CLOSE_IMMEDIATELY |
+                            MG_HEADERS_SENT | MG_LONG_RUNNING);
   c->request_method = c->uri = c->http_version = c->query_string = NULL;
   c->num_headers = c->status_code = c->is_websocket = c->content_len = 0;
   free(conn->request); conn->request = NULL;
@@ -4535,8 +4557,10 @@ static void mg_ev_handler(struct ns_connection *nc, enum ns_event ev, void *p) {
     case NS_RECV:
       if (nc->flags & NSF_ACCEPTED) {
         process_request(conn);
+#ifndef MONGOOSE_NO_CGI
       } else if (nc->flags & MG_CGI_CONN) {
         on_cgi_data(nc);
+#endif
       } else {
         process_response(conn);
       }
